@@ -1,0 +1,15 @@
+[package]
+name = "segmenter"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "segmenter"
+path = "src/main.rs"
+
+[dependencies]
+ffmpeg-next = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

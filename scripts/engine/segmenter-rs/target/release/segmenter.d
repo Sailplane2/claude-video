@@ -1,0 +1,1 @@
+/Users/michaelmason/claude-video/scripts/engine/segmenter-rs/target/release/segmenter: /Users/michaelmason/claude-video/scripts/engine/segmenter-rs/src/lib.rs /Users/michaelmason/claude-video/scripts/engine/segmenter-rs/src/main.rs

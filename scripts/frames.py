@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Probe video metadata and extract frames at an auto-scaled fps.
+"""Probe video metadata and extract frames at an auto-scaled fps or via scene detection.
 
 Auto-fps targets a frame budget, not a fixed rate. Token cost scales with frame
 count, so budget-by-duration keeps short videos dense and long videos capped.
 When a user-specified range is passed, focused-mode budgets denser (they are
 zooming in for detail).
+
+Scene detection (--scene-detect) uses ffmpeg's select filter to grab a frame
+whenever the visual scene changes, rather than on a fixed timer. This is
+vastly better for long videos (1hr+ courses, lectures) where timer-based
+extraction misses content between widely-spaced intervals.
 """
 from __future__ import annotations
 
@@ -16,6 +21,14 @@ from pathlib import Path
 
 
 MAX_FPS = 2.0
+
+
+def _even_sample(total: int, keep: int) -> set[int]:
+    """Return evenly-spaced indices to keep when reducing total → keep frames."""
+    if keep >= total:
+        return set(range(total))
+    step = (total - 1) / (keep - 1) if keep > 1 else 0
+    return {min(total - 1, int(round(i * step))) for i in range(keep)}
 
 
 def _clamp_fps(fps: float, duration_seconds: float, max_frames: int) -> tuple[float, int]:
@@ -131,6 +144,56 @@ def auto_fps_focus(duration_seconds: float, max_frames: int = 100) -> tuple[floa
     return _clamp_fps(target / duration_seconds, duration_seconds, max_frames)
 
 
+def _average_hash(img_path: Path, hash_size: int = 8) -> int:
+    """Compute the average hash (aHash) of an image.
+
+    Returns a 64-bit integer where each bit is 1 if the corresponding pixel
+    is brighter than the mean.  Uses PIL; returns 0 if PIL is unavailable.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return 0
+
+    img = Image.open(img_path).convert("L").resize((hash_size, hash_size), Image.LANCZOS)
+    pixels = list(img.getdata())
+    mean = sum(pixels) / len(pixels)
+    bits = [1 if p > mean else 0 for p in pixels]
+    return int("".join(str(b) for b in bits), 2)
+
+
+def _hamming_distance(a: int, b: int) -> int:
+    """Count the number of differing bits between two integers (hashes)."""
+    return (a ^ b).bit_count()
+
+
+def deduplicate_frames(frame_paths: list[Path], threshold: int = 10) -> list[Path]:
+    """Remove near-duplicate adjacent frames using perceptual hashing.
+
+    Compares each frame to the last *kept* frame.  If the Hamming distance
+    between their average hashes is below *threshold* (out of 64 bits), the
+    frame is discarded.
+
+    Returns the subset of *frame_paths* that survived deduplication.  Always
+    keeps the first frame.
+    """
+    if len(frame_paths) <= 1:
+        return frame_paths
+
+    kept: list[Path] = [frame_paths[0]]
+    last_hash = _average_hash(frame_paths[0])
+
+    for p in frame_paths[1:]:
+        h = _average_hash(p)
+        if _hamming_distance(last_hash, h) >= threshold:
+            kept.append(p)
+            last_hash = h
+        else:
+            p.unlink()  # remove duplicate from disk
+
+    return kept
+
+
 def extract(
     video_path: str,
     out_dir: Path,
@@ -139,6 +202,11 @@ def extract(
     max_frames: int = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    scene_detect: bool = False,
+    scene_threshold: float = 0.3,
+    keyframe: bool = False,
+    dedup: bool = False,
+    dedup_threshold: int = 10,
 ) -> list[dict]:
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
@@ -161,20 +229,62 @@ def extract(
     if end_seconds is not None:
         cmd += ["-to", f"{end_seconds:.3f}"]
 
-    cmd += [
-        "-i", video_path,
-        "-vf", f"fps={fps},scale={resolution}:-2",
-        "-frames:v", str(max_frames),
-        "-q:v", "4",
-        output_pattern,
-    ]
+    cmd += ["-i", video_path]
+
+    if keyframe:
+        # Keyframe-only: select I-frames (pre-encoded full snapshots).
+        # No decoding of delta frames — ~40× faster than scene-detect.
+        vf = f"select='eq(pict_type,I)',scale={resolution}:-2"
+        cmd += [
+            "-vf", vf,
+            "-vsync", "vfr",
+            "-q:v", "4",
+            output_pattern,
+        ]
+    elif scene_detect:
+        # Scene detection: grab a frame whenever the visual scene changes.
+        vf = f"select='gt(scene,{scene_threshold})',scale={resolution}:-2"
+        cmd += [
+            "-vf", vf,
+            "-vsync", "vfr",
+            "-q:v", "4",
+            output_pattern,
+        ]
+    else:
+        cmd += [
+            "-vf", f"fps={fps},scale={resolution}:-2",
+            "-frames:v", str(max_frames),
+            "-q:v", "4",
+            output_pattern,
+        ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg frame extraction failed: {result.stderr.strip()}")
 
-    offset = start_seconds or 0.0
     frames = sorted(out_dir.glob("frame_*.jpg"))
+
+    # Keyframe / scene detection can produce more frames than max_frames. Sample evenly.
+    if (scene_detect or keyframe) and len(frames) > max_frames:
+        keep = _even_sample(len(frames), max_frames)
+        for i, p in enumerate(frames):
+            if i not in keep:
+                p.unlink()
+        frames = [p for i, p in enumerate(frames) if i in keep]
+
+    # Deduplicate: discard near-identical adjacent frames (talking-head killer).
+    if dedup and len(frames) > 1:
+        before = len(frames)
+        frames = deduplicate_frames(frames, threshold=dedup_threshold)
+        if len(frames) < before:
+            # Renumber remaining frames to keep sequential naming
+            for i, p in enumerate(frames):
+                new_name = out_dir / f"frame_{i + 1:04d}.jpg"
+                if p != new_name:
+                    p.rename(new_name)
+            frames = sorted(out_dir.glob("frame_*.jpg"))
+
+    offset = start_seconds or 0.0
     return [
         {
             "index": i,
