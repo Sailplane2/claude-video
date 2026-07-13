@@ -36,6 +36,9 @@ def _read_openai_api_key() -> str:
 
 
 MODEL_COSTS = {
+    "gpt-5.6-sol":       {"input": 5.00, "output": 30.00},
+    "gpt-5.6-terra":     {"input": 2.50, "output": 15.00},
+    "gpt-5.6-luna":      {"input": 1.00, "output": 6.00},
     "gpt-4o":            {"input": 2.50, "output": 10.00},
     "gpt-4o-mini":       {"input": 0.15, "output": 0.60},
     "gpt-4-turbo":       {"input": 10.00, "output": 30.00},
@@ -72,12 +75,22 @@ class OpenAIAdapter(ProviderAdapter):
                 return costs
         return DEFAULT_COST
 
+    # Newer model families reject `max_tokens` and require `max_completion_tokens`
+    # instead (first seen with o1-*, confirmed also true for gpt-5.6-*).
+    _NEW_PARAM_PREFIXES = ("o1-", "gpt-5.6-")
+
     def call(self, messages: List[Dict], model: Optional[str] = None,
-             max_tokens: int = 2048, temperature: float = 0.7,
+             max_tokens: Optional[int] = None, temperature: float = 0.7,
              timeout: int = 60) -> ProviderResponse:
         """Send a chat completion request to OpenAI."""
         model = model or self.default_model
         start_time = time.time()
+        uses_max_completion_tokens = model.startswith(self._NEW_PARAM_PREFIXES)
+        if max_tokens is None:
+            # Reasoning models (o1-*, gpt-5.6-*) spend part of this budget on
+            # hidden reasoning tokens before any visible output — 2048 can be
+            # entirely consumed by reasoning with nothing visible left over.
+            max_tokens = 16000 if uses_max_completion_tokens else 2048
 
         last_error = None
         # Retry loop for 429 and 5xx
@@ -88,12 +101,20 @@ class OpenAIAdapter(ProviderAdapter):
 
         while True:
             try:
+                token_param = (
+                    {"max_completion_tokens": max_tokens}
+                    if uses_max_completion_tokens
+                    else {"max_tokens": max_tokens}
+                )
+                # o1-*/gpt-5.6-* reasoning models only support the default
+                # temperature (1) and reject any explicit override.
+                temp_param = {} if uses_max_completion_tokens else {"temperature": temperature}
                 response = self.client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
                     timeout=timeout,
+                    **token_param,
+                    **temp_param,
                 )
                 elapsed_ms = int((time.time() - start_time) * 1000)
 
