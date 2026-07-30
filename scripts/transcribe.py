@@ -52,6 +52,34 @@ def parse_vtt(path: str) -> list[dict]:
     return _dedupe(segments)
 
 
+MIN_OVERLAP_WORDS = 4
+OVERLAP_SEARCH_WINDOW = 20  # only look near the boundary, never deep into merged history
+
+
+def _word_overlap(prev_text: str, next_text: str) -> int:
+    """Length (in words) of the longest suffix of prev_text that's also a prefix of next_text.
+
+    Catches YouTube's 2-line rolling-caption format: each cue shows [chunk N, chunk N+1],
+    the next cue shows [chunk N+1, chunk N+2] — the tail of one cue is the head of the next,
+    not a growing prefix (already handled below) and not an exact repeat.
+
+    Requires >= MIN_OVERLAP_WORDS AND at least half of next_text's words, so a coincidental
+    short common phrase ("of the", "you know") can't false-positive a merge across two
+    genuinely unrelated cues — real rolling-caption overlap covers roughly half a cue.
+    Only searches the last OVERLAP_SEARCH_WINDOW words of prev_text, not its full (possibly
+    long, already-merged) history, so one real match can't cascade into swallowing everything
+    that follows.
+    """
+    prev_words = prev_text.split()[-OVERLAP_SEARCH_WINDOW:]
+    next_words = next_text.split()
+    min_needed = max(MIN_OVERLAP_WORDS, (len(next_words) + 1) // 2)
+    max_check = min(len(prev_words), len(next_words))
+    for k in range(max_check, min_needed - 1, -1):
+        if prev_words[-k:] == next_words[:k]:
+            return k
+    return 0
+
+
 def _dedupe(segments: list[dict]) -> list[dict]:
     """Collapse rolling duplicates common in YouTube auto-subs."""
     out: list[dict] = []
@@ -63,6 +91,14 @@ def _dedupe(segments: list[dict]) -> list[dict]:
             out[-1]["text"] = seg["text"]
             out[-1]["end"] = seg["end"]
             continue
+        if out:
+            k = _word_overlap(out[-1]["text"], seg["text"])
+            if k > 0:
+                new_words = seg["text"].split()[k:]
+                if new_words:
+                    out[-1]["text"] = out[-1]["text"] + " " + " ".join(new_words)
+                out[-1]["end"] = seg["end"]
+                continue
         out.append(seg)
     return out
 
