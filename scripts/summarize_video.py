@@ -37,7 +37,13 @@ SYSTEM_PROMPT = (
     "- Notable visuals mentioned in frame descriptions\n"
     "- A summary of spoken content (if transcript provided)\n"
     "- If a specific question was asked, answer it directly in a dedicated section\n"
-    "Be concise and factual. Use bullet points and section headers for readability."
+    "Be concise and factual. Use bullet points and section headers for readability.\n\n"
+    "At the very end of your response, ALWAYS append two metadata lines:\n"
+    "<!--TAGS: tag1, tag2, tag3-->\n"
+    "<!--TYPE: tutorial|talk|interview|lecture|documentary|other-->\n"
+    "Choose 3-4 lowercase tags that best describe the video's topics and "
+    "techniques. Pick the single most accurate type. These lines must appear "
+    "exactly as shown, on their own lines, after all other content."
 )
 
 
