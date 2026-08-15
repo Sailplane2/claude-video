@@ -1,4 +1,4 @@
-"""Search core: embed query, search Chroma, group/filter, format output."""
+"""Search core: embed query, search store, group/filter, format output."""
 
 import json
 import sys
@@ -6,9 +6,8 @@ import time
 from dataclasses import dataclass, field
 
 from . import embedder
-from . import chroma_store
 from .scanner import scan
-from .utils import date_to_epoch
+from .utils import date_to_epoch, get_store
 
 
 @dataclass
@@ -26,6 +25,9 @@ class ChunkMatch:
     summary_path: str
     text: str
     score: float
+    source_type: str = "video"
+    document_id: str = ""
+    author: str = ""
 
 
 @dataclass
@@ -41,6 +43,8 @@ class VideoMatch:
     best_score: float
     chunk_count: int
     matched_chunks: list[ChunkMatch] = field(default_factory=list)
+    source_type: str = "video"
+    author: str = ""
 
 
 @dataclass
@@ -55,7 +59,7 @@ class SearchResult:
 
 
 def _parse_raw_results(raw: dict) -> list[ChunkMatch]:
-    """Parse Chroma's raw query response into ChunkMatch objects."""
+    """Parse the store's raw query response into ChunkMatch objects."""
     matches = []
     ids_list = raw.get("ids", [[]])[0]
     distances = raw.get("distances", [[]])[0]
@@ -83,19 +87,23 @@ def _parse_raw_results(raw: dict) -> list[ChunkMatch]:
             summary_path=meta.get("summary_path", ""),
             text=doc,
             score=similarity,
+            source_type=meta.get("source_type", "video"),
+            document_id=meta.get("document_id", ""),
+            author=meta.get("author", ""),
         ))
 
     return matches
 
 
 def _group_by_video(chunks: list[ChunkMatch], k: int) -> list[VideoMatch]:
-    """Group chunk matches by video_id, ranked by best-chunk score."""
+    """Group chunk matches by source id (video_id or document_id), ranked by best score."""
     groups: dict[str, VideoMatch] = {}
 
     for c in chunks:
-        if c.video_id not in groups:
-            groups[c.video_id] = VideoMatch(
-                video_id=c.video_id,
+        gid = c.video_id if c.video_id else c.document_id
+        if gid not in groups:
+            groups[gid] = VideoMatch(
+                video_id=gid,
                 title=c.title,
                 channel=c.channel,
                 source=c.source,
@@ -105,13 +113,14 @@ def _group_by_video(chunks: list[ChunkMatch], k: int) -> list[VideoMatch]:
                 summary_path=c.summary_path,
                 best_score=c.score,
                 chunk_count=0,
+                source_type=c.source_type,
+                author=c.author,
             )
-        group = groups[c.video_id]
+        group = groups[gid]
         group.chunk_count += 1
         group.best_score = max(group.best_score, c.score)
         group.matched_chunks.append(c)
 
-    # Sort by best score descending
     ranked = sorted(groups.values(), key=lambda g: g.best_score, reverse=True)
     return ranked[:k]
 
@@ -158,10 +167,10 @@ def _apply_filters(chunks: list[ChunkMatch], tags=None, channel=None, platform=N
     return filtered
 
 
-def _get_coverage() -> dict:
+def _get_coverage(store) -> dict:
     """Get coverage stats for status line."""
     result = scan()
-    indexed = chroma_store.get_video_ids()
+    indexed = store.get_video_ids()
     return {
         "total": len(result.videos),
         "indexed": len(indexed),
@@ -172,7 +181,6 @@ def _make_obsidian_link(path_str: str) -> str:
     """Create an Obsidian deep link from a file path."""
     if not path_str:
         return ""
-    # Convert to vault-relative path
     vault = "michael-brain"
     try:
         from pathlib import Path
@@ -186,8 +194,8 @@ def _make_obsidian_link(path_str: str) -> str:
         return f"obsidian://open?vault={vault}&file={filename}"
 
 
-def _search_with_grep(query: str, tags=None, channel=None, video_type=None) -> SearchResult:
-    """Fallback: grep-based search through all summary bodies."""
+def _search_with_grep(query: str, tags=None, channel=None, video_type=None, store=None) -> SearchResult:
+    """Fallback: grep-based search through all summary bodies (video-only)."""
     result = scan()
     start = time.time()
 
@@ -195,7 +203,6 @@ def _search_with_grep(query: str, tags=None, channel=None, video_type=None) -> S
     matches: list[tuple] = []
 
     for video in result.videos:
-        # Apply filters
         fm = video.frontmatter
         if channel and channel.lower() not in fm.get("channel", "").lower():
             continue
@@ -208,12 +215,10 @@ def _search_with_grep(query: str, tags=None, channel=None, video_type=None) -> S
                 continue
 
         body_lower = video.body.lower()
-        # Score: ratio of query terms found
         match_count = sum(1 for t in terms if t in body_lower)
         if match_count > 0:
             matches.append((video, match_count / len(terms)))
 
-    # Sort by match ratio
     matches.sort(key=lambda x: x[1], reverse=True)
 
     chunk_matches = []
@@ -236,7 +241,7 @@ def _search_with_grep(query: str, tags=None, channel=None, video_type=None) -> S
         ))
 
     elapsed = int((time.time() - start) * 1000)
-    coverage = _get_coverage()
+    coverage = _get_coverage(store) if store is not None else {"total": len(result.videos), "indexed": 0}
 
     return SearchResult(
         query=query,
@@ -255,60 +260,65 @@ def search(query: str, mode: str = "videos", k: int = 25,
            tags: list[str] | None = None, channel: str | None = None,
            platform: str | None = None, video_type: str | None = None,
            after_date: str | None = None, before_date: str | None = None,
-           min_rating: int | None = None) -> SearchResult:
+           min_rating: int | None = None, backend: str = "neo4j",
+           kind: str = "all") -> SearchResult:
     """Core search function — the API that programmatic callers use.
 
     Args:
         query: Natural language search query.
-        mode: "videos" (grouped by video) or "passages" (individual chunks).
+        mode: "videos" (grouped) or "passages" (individual chunks).
         k: Number of results to return.
-        tags: Filter to videos with ALL these tags.
+        tags: Filter to content with ALL these tags.
         channel: Filter by channel name (case-insensitive substring).
         platform: Filter by platform.
         video_type: Filter by video type.
         after_date: YYYY-MM-DD lower bound.
         before_date: YYYY-MM-DD upper bound.
         min_rating: Minimum rating (1-5).
+        backend: "chroma" or "neo4j".
+        kind: "video", "document", or "all".
 
     Returns:
         SearchResult with results, coverage info, and timing.
     """
+    store = get_store(backend)
     start = time.time()
 
-    # Try embedding → Chroma search
+    # Try embedding → vector search
     try:
         query_embedding = embedder.embed_single(query)
     except Exception as e:
         print(f"Embedding failed ({e}). Falling back to grep.", file=sys.stderr)
-        return _search_with_grep(query, tags, channel, video_type)
+        return _search_with_grep(query, tags, channel, video_type, store)
 
     try:
-        raw = chroma_store.search_chunks(query_embedding, k=k * 2)
+        raw = store.search_chunks(query_embedding, k=k * 2)
     except Exception as e:
-        print(f"Chroma search failed ({e}). Falling back to grep.", file=sys.stderr)
-        return _search_with_grep(query, tags, channel, video_type)
+        print(f"Vector search failed ({e}). Falling back to grep.", file=sys.stderr)
+        return _search_with_grep(query, tags, channel, video_type, store)
 
-    # Parse results
     raw_chunks = _parse_raw_results(raw)
 
-    # Fall back to grep if Chroma returns nothing (empty index)
-    if not raw_chunks:
-        return _search_with_grep(query, tags, channel, video_type)
+    # Filter by content type
+    if kind != "all":
+        raw_chunks = [c for c in raw_chunks if c.source_type == kind]
 
-    # Apply in-memory filters
+    # Fall back to grep if the index returns nothing (empty index)
+    if not raw_chunks:
+        return _search_with_grep(query, tags, channel, video_type, store)
+
     filtered = _apply_filters(raw_chunks, tags, channel, platform, video_type,
                               after_date, before_date, min_rating)
 
-    # Format by mode
     if mode == "videos":
         results = _group_by_video(filtered, k)
-        matched_count = len({c.video_id for c in filtered})
+        matched_count = len({c.video_id or c.document_id for c in filtered})
     else:
         results = filtered[:k]
-        matched_count = len({c.video_id for c in filtered})
+        matched_count = len({c.video_id or c.document_id for c in filtered})
 
     elapsed = int((time.time() - start) * 1000)
-    coverage = _get_coverage()
+    coverage = _get_coverage(store)
 
     return SearchResult(
         query=query,
@@ -327,7 +337,8 @@ def run(query: str, mode: str = "videos", k: int = 25,
         platform: str | None = None, video_type: str | None = None,
         after_date: str | None = None, before_date: str | None = None,
         min_rating: int | None = None, json_output: bool = False,
-        no_fallback: bool = False):
+        no_fallback: bool = False, backend: str = "neo4j",
+        kind: str = "all"):
     """CLI entry point for search. Formats and prints results."""
 
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
@@ -336,7 +347,7 @@ def run(query: str, mode: str = "videos", k: int = 25,
         query=query, mode=mode, k=k,
         tags=tag_list, channel=channel, platform=platform,
         video_type=video_type, after_date=after_date, before_date=before_date,
-        min_rating=min_rating,
+        min_rating=min_rating, backend=backend, kind=kind,
     )
 
     if json_output:
@@ -353,9 +364,11 @@ def _to_json(result: SearchResult) -> dict:
     for r in result.results:
         if isinstance(r, VideoMatch):
             items.append({
+                "type": r.source_type,
                 "video_id": r.video_id,
                 "title": r.title,
                 "channel": r.channel,
+                "author": r.author,
                 "source": r.source,
                 "tags": r.tags,
                 "date": r.date_iso,
@@ -367,8 +380,11 @@ def _to_json(result: SearchResult) -> dict:
             })
         else:
             items.append({
+                "type": r.source_type,
                 "video_id": r.video_id,
+                "document_id": r.document_id,
                 "title": r.title,
+                "author": r.author,
                 "section": r.section_title,
                 "score": round(r.score, 4),
                 "text_snippet": r.text[:200],
@@ -411,14 +427,17 @@ def _render_markdown(result: SearchResult):
             link = _make_obsidian_link(r.summary_path)
             tags_display = r.tags.replace("|", "` `").strip("`").strip()
             print(f"### {i + 1}. {r.title}")
-            print(f"**Channel:** {r.channel} | **Date:** {r.date_iso} | "
-                  f"**Rating:** {'⭐' * r.rating if r.rating > 0 else '—'} | "
-                  f"**Score:** {r.best_score:.3f}")
+            if r.source_type == "document":
+                print(f"**Type:** document | **Author:** {r.author} | **Date:** {r.date_iso} | "
+                      f"**Score:** {r.best_score:.3f}")
+            else:
+                print(f"**Channel:** {r.channel} | **Date:** {r.date_iso} | "
+                      f"**Rating:** {'⭐' * r.rating if r.rating > 0 else '—'} | "
+                      f"**Score:** {r.best_score:.3f}")
             if tags_display:
                 print(f"`{tags_display}`")
             if link:
                 print(f"[Open in Obsidian]({link})")
-            # Show best snippet
             if r.matched_chunks:
                 snippet = r.matched_chunks[0].text.replace(
                     r.matched_chunks[0].text.split("\n\n")[0], ""
@@ -429,7 +448,10 @@ def _render_markdown(result: SearchResult):
         else:
             link = _make_obsidian_link(r.summary_path)
             print(f"### {i + 1}. {r.title} — {r.section_title}")
-            print(f"**Score:** {r.score:.3f}")
+            if r.source_type == "document":
+                print(f"**Type:** document | **Score:** {r.score:.3f}")
+            else:
+                print(f"**Score:** {r.score:.3f}")
             if link:
                 print(f"[Open in Obsidian]({link})")
             print(f"> {r.text[:300]}...")

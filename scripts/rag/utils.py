@@ -26,6 +26,21 @@ def chroma_dir() -> Path:
     return Path.home() / ".claude-video" / "chroma"
 
 
+def documents_dir() -> Path:
+    """Return the documents directory (extracted PDF markdown)."""
+    return vault_root() / "documents"
+
+
+def documents_index_path() -> Path:
+    """Return path to documents/index.json manifest."""
+    return documents_dir() / "index.json"
+
+
+def docs_source_dir() -> Path:
+    """Return the drop folder for source PDFs (kept out of the vault)."""
+    return Path.home() / "claude-video" / "docs" / "source"
+
+
 def eval_set_path() -> Path:
     """Return path to the eval set JSON file."""
     return Path.home() / ".claude-video" / "eval_set.json"
@@ -96,3 +111,21 @@ EMBED_BATCH_SIZE = 20
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.0  # seconds
 DEFAULT_SEARCH_K = 25
+
+
+# ── Backend selection ──────────────────────────────────────────────────────
+
+def get_store(backend: str = "neo4j"):
+    """Return the storage module for the requested backend.
+
+    Both chroma_store and neo4j_store expose the same video-facing surface so
+    rebuild/sync/search/status/validate/prune work unchanged behind a
+    `--backend {chroma,neo4j}` flag. neo4j_store additionally exposes document
+    functions. Neo4j is the default; Chroma remains available as the frozen
+    fallback via `--backend chroma`.
+    """
+    if backend == "neo4j":
+        from . import neo4j_store
+        return neo4j_store
+    from . import chroma_store
+    return chroma_store
