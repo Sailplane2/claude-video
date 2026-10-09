@@ -313,6 +313,16 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    # Persist the transcript to a file so it survives the download-dir cleanup.
+    # The caption VTT lives inside download/ (which the caller deletes); once it
+    # is gone, recovering the text means a fresh yt-dlp caption request that
+    # YouTube may 429-rate-limit. Writing transcript.txt here makes that
+    # re-request unnecessary.
+    if transcript_text:
+        transcript_path = work / "transcript.txt"
+        transcript_path.write_text(transcript_text, encoding="utf-8")
+        print(f"[watch] transcript saved → {transcript_path}", file=sys.stderr)
+
     # ---- Frame extraction ---------------------------------------------------
 
     frames: list[dict] = []
