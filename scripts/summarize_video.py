@@ -41,8 +41,10 @@ SYSTEM_PROMPT = (
     "At the very end of your response, ALWAYS append two metadata lines:\n"
     "<!--TAGS: tag1, tag2, tag3-->\n"
     "<!--TYPE: tutorial|talk|interview|lecture|documentary|other-->\n"
-    "Choose 3-4 lowercase tags that best describe the video's topics and "
-    "techniques. Pick the single most accurate type. These lines must appear "
+    "Choose 5-8 concise kebab-case tags (lowercase, hyphen-separated, no "
+    "spaces, no '#' prefix, e.g. 'machine-learning') that best describe the "
+    "video's topics and techniques — prefer specific single-concept tags over "
+    "generic ones. Pick the single most accurate type. These lines must appear "
     "exactly as shown, on their own lines, after all other content."
 )
 
