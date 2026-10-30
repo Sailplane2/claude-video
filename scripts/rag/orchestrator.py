@@ -58,7 +58,13 @@ class IndexingState(TypedDict):
 
 
 def _scan_node(state: IndexingState) -> dict:
-    """Node 1: scan the corpus. Outputs the list of VideoRecords to fan out over."""
+    """Node 1: scan the corpus. Outputs the list of VideoRecords to fan out over.
+
+    If the caller already scanned (rebuild.py does, to report issues first),
+    the pre-supplied `videos` list is used as-is instead of re-scanning.
+    """
+    if state.get("videos"):
+        return {}
     override = Path(state["videos_dir"]) if state.get("videos_dir") else None
     result = scan(videos_dir_override=override)
     return {"videos": result.videos}

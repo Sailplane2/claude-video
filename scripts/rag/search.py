@@ -284,17 +284,12 @@ def search(query: str, mode: str = "videos", k: int = 25,
     store = get_store(backend)
     start = time.time()
 
-    # Try embedding → vector search
+    # Embed + vector search via the LangGraph retrieval graph (orchestrator.py)
+    from .orchestrator import run_retrieval
     try:
-        query_embedding = embedder.embed_single(query)
+        raw = run_retrieval(query, k=k * 2, backend=backend)["raw"]
     except Exception as e:
-        print(f"Embedding failed ({e}). Falling back to grep.", file=sys.stderr)
-        return _search_with_grep(query, tags, channel, video_type, store)
-
-    try:
-        raw = store.search_chunks(query_embedding, k=k * 2)
-    except Exception as e:
-        print(f"Vector search failed ({e}). Falling back to grep.", file=sys.stderr)
+        print(f"Vector retrieval failed ({e}). Falling back to grep.", file=sys.stderr)
         return _search_with_grep(query, tags, channel, video_type, store)
 
     raw_chunks = _parse_raw_results(raw)

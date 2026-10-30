@@ -20,21 +20,29 @@ def _print_issue(issue) -> None:
 
 
 def _rebuild_videos(store, videos) -> tuple[int, int]:
-    total_chunks = 0
-    errors = 0
+    """Index videos through the LangGraph indexing graph (orchestrator.py).
+
+    The graph fans out one process_video node per video; we pass the
+    already-scanned list in so it doesn't re-scan. `store` is unused here —
+    each graph node resolves its own store from the backend name.
+    """
+    from .orchestrator import build_indexing_graph
+    backend = "neo4j" if store.__name__.endswith("neo4j_store") else "chroma"
+    out = build_indexing_graph().invoke({"backend": backend, "videos": videos})
+    by_id = {s["video_id"]: s for s in out.get("summaries", [])}
+    total_chunks = errors = 0
     for i, video in enumerate(videos):
-        if video.status in ("archived", "deleted"):
-            print(f"  [video {i + 1}/{len(videos)}] SKIP {video.video_id} (status={video.status})")
-            continue
-        try:
-            chunks = chunk_summary(video.body, video.frontmatter)
-            store.upsert_chunks(chunks, video, EMBED_MODEL, CHUNKER_VERSION)
-            total_chunks += len(chunks)
-            print(f"  [video {i + 1}/{len(videos)}] {video.video_id} → {len(chunks)} chunks "
-                  f"({video.frontmatter.get('title', 'untitled')[:60]})")
-        except Exception as e:
-            print(f"  [video {i + 1}/{len(videos)}] ERROR {video.video_id}: {e}", file=sys.stderr)
+        s = by_id.get(video.video_id, {})
+        tag = f"  [video {i + 1}/{len(videos)}]"
+        if s.get("skipped"):
+            print(f"{tag} SKIP {video.video_id} (status={video.status})")
+        elif "error" in s:
+            print(f"{tag} ERROR {video.video_id}: {s['error']}", file=sys.stderr)
             errors += 1
+        else:
+            total_chunks += s.get("chunks", 0)
+            print(f"{tag} {video.video_id} → {s.get('chunks', 0)} chunks "
+                  f"({video.frontmatter.get('title', 'untitled')[:60]})")
     return total_chunks, errors
 
 
